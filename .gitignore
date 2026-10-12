@@ -4,3 +4,7 @@
 !requirements.txt
 !intensity_fit/
 !intensity_fit/*.py
+!pytest.ini
+!requirements-dev.txt
+!tests/
+!tests/*.py
