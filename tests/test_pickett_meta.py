@@ -120,3 +120,53 @@ def test_read_egy(tmp_path):
 def test_numbers_parses_scientific_and_signed():
     assert pm._numbers("a -1.5e-3 +2 .5 3.") == [-1.5e-3, 2.0, 0.5, 3.0]
     assert pm._numbers("none") == []
+
+
+# ---------- dipoles are identified by ID (001/002/003), not by the comment ----------
+
+HEADER = "t\n0 91 504.77 0 40 -9.0 -9.0 18 1.0\n"
+
+
+def _int(tmp_path, body):
+    path = tmp_path / "x.int"
+    path.write_text(HEADER + body)
+    return pm.read_int_metadata(str(path))
+
+
+def test_wrong_comments_are_ignored(tmp_path):
+    meta = _int(tmp_path, "   001    1.00     / a dipole moment\n   002    0.75     / a dipole moment\n   003    0.54     / c dipole moment\n")
+    assert meta["dipoles"] == {"a": 1.00, "b": 0.75, "c": 0.54}
+    assert meta["warnings"] == []
+
+
+def test_comments_with_other_letters_are_ignored(tmp_path):
+    meta = _int(tmp_path, "   001    2.54     / c dipole moment\n   002    1.20     / c dipole moment\n   003    0.15     / a dipole moment\n")
+    assert meta["dipoles"] == {"a": 2.54, "b": 1.20, "c": 0.15}
+
+
+def test_duplicate_id_is_added_like_spcat_and_flagged(tmp_path):
+    meta = _int(tmp_path, "   001    2.65     / a dipole moment\n   001    0.30     / a dipole moment\n   003    0.20     / c dipole moment\n")
+    assert meta["dipoles"]["a"] == pytest.approx(2.95)
+    assert "b" not in meta["dipoles"]
+    assert meta["dipole_ids"] == {"a": 2, "c": 1}
+    assert len(meta["warnings"]) == 1
+    assert "001" in meta["warnings"][0] and "2.95" in meta["warnings"][0]
+
+
+def test_duplicate_values_keep_their_sign(tmp_path):
+    meta = _int(tmp_path, "   001    2.65\n   001   -0.30\n")
+    assert meta["dipoles"]["a"] == pytest.approx(2.35)
+
+
+def test_non_standard_id_falls_back_to_the_comment(tmp_path):
+    meta = _int(tmp_path, "   010    1.50     / b dipole moment\n")
+    assert meta["dipoles"] == {"b": 1.5}
+
+
+def test_non_standard_id_without_comment_is_ignored(tmp_path):
+    assert _int(tmp_path, "   010    1.50\n")["dipoles"] == {}
+
+
+def test_missing_ids_leave_components_undefined(tmp_path):
+    meta = _int(tmp_path, "   001    0.43     / a dipole moment\n   003    1.21     / c dipole moment\n")
+    assert meta["dipoles"] == {"a": 0.43, "c": 1.21}

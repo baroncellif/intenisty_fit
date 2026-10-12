@@ -94,6 +94,10 @@ def build_species_prediction_table(species_cfg: SpeciesConfig, fit_options: FitO
     merged.attrs["dipoles"] = dipoles
     merged.attrs["delta_E_cm1"] = species_cfg.delta_E_cm1
     merged.attrs["conformer_degeneracy"] = species_cfg.conformer_degeneracy
+    merged.attrs["dEe"] = species_cfg.dEe
+    merged.attrs["dE0"] = species_cfg.dE0
+    merged.attrs["group"] = species_cfg.group
+    merged.attrs["label"] = species_cfg.label or species_cfg.name
     return merged.reset_index(drop=True)
 
 
@@ -144,6 +148,11 @@ def build_observation_table(
 def build_line_diagnostic_table(species_tables, spectrum_df, result, fit_options, q_functions=None) -> pd.DataFrame:
     q_functions = q_functions or {}
     rows = []
+    cl = {}
+    obs_tab = result.get("observation_table")
+    if obs_tab is not None and "cluster_model" in obs_tab.columns:
+        for r in obs_tab.itertuples():
+            cl[(r.species, round(float(r.lin_freq_MHz), 6), str(r.QN_all))] = (int(r.cluster), int(r.n_in_cluster), float(r.cluster_exp), float(r.cluster_model))
 
     for name, tab in species_tables.items():
         Tnow = result["species"][name]["Trot_K"]
@@ -184,6 +193,11 @@ def build_line_diagnostic_table(species_tables, spectrum_df, result, fit_options
         residual = exp_I - model
 
         for i in range(len(tab)):
+            blended = cl.get((name, round(float(tab.iloc[i]["lin_freq_MHz"]), 6), str(tab.iloc[i]["QN_all"])))
+            if blended is not None and np.isfinite(blended[2]) and np.isfinite(blended[3]):
+                res_i = blended[2] - blended[3]
+            else:
+                res_i = float(residual[i]) if np.isfinite(residual[i]) else np.nan
             rows.append({
                 "species": name,
                 "temperature_group": result["species"][name].get("temperature_group", "NA"),
@@ -193,8 +207,12 @@ def build_line_diagnostic_table(species_tables, spectrum_df, result, fit_options
                 "delta_MHz": float(tab.iloc[i]["delta_MHz"]),
                 "exp_intensity": float(exp_I[i]) if np.isfinite(exp_I[i]) else np.nan,
                 "model_intensity": float(model[i]),
-                "residual": float(residual[i]) if np.isfinite(residual[i]) else np.nan,
-                "abs_residual": float(abs(residual[i])) if np.isfinite(residual[i]) else np.nan,
+                "cluster": blended[0] if blended else -1,
+                "n_in_cluster": blended[1] if blended else 1,
+                "cluster_exp": blended[2] if blended else np.nan,
+                "cluster_model": blended[3] if blended else np.nan,
+                "residual": res_i,
+                "abs_residual": abs(res_i) if np.isfinite(res_i) else np.nan,
                 "ELO_cm-1": float(tab.iloc[i]["elo_cm-1"]),
                 "lgint": float(tab.iloc[i]["lgint"]),
                 "I_cat": float(tab.iloc[i]["I_cat"]),
@@ -212,6 +230,10 @@ def build_line_diagnostic_table(species_tables, spectrum_df, result, fit_options
 
     out = pd.DataFrame(rows)
     return out.sort_values(["species", "lin_freq_MHz"]).reset_index(drop=True) if not out.empty else out
+
+
+def _nan_if_none(value) -> float:
+    return np.nan if value is None else float(value)
 
 
 def residual_metrics(residuals) -> dict[str, float]:
@@ -239,6 +261,8 @@ def build_species_diagnostic_summary(species_tables, result, line_diag_df=None) 
 
         rows.append({
             "species": name,
+            "label": tab.attrs.get("label") or name,
+            "group": tab.attrs.get("group") or "",
             "temperature_group": vals.get("temperature_group", "NA"),
             "n_lines": int(len(tab)),
             **metrics,
@@ -248,6 +272,9 @@ def build_species_diagnostic_summary(species_tables, result, line_diag_df=None) 
             "elo_max_cm-1": float(tab["elo_cm-1"].max()),
             "scale": vals["scale"],
             "scale_err": vals.get("scale_err", np.nan),
+            "relative_abundance_err": vals.get("relative_abundance_err", np.nan),
+            "relative_abundance_mc_rms": vals.get("relative_abundance_mc_rms", np.nan),
+            "population_relmax_err": vals.get("population_relmax_err", np.nan),
             "relative_abundance": vals["relative_abundance"],
             "population_relmax": vals["population_relmax"],
             "Trot_K": vals["Trot_K"],
@@ -256,6 +283,8 @@ def build_species_diagnostic_summary(species_tables, result, line_diag_df=None) 
             "n_b_type": int((tab.get("dipole_component", pd.Series(dtype=str)) == "b").sum()),
             "n_c_type": int((tab.get("dipole_component", pd.Series(dtype=str)) == "c").sum()),
             "delta_E_cm-1": tab.attrs.get("delta_E_cm1", np.nan),
+            "dEe": _nan_if_none(tab.attrs.get("dEe")),
+            "dE0": _nan_if_none(tab.attrs.get("dE0")),
             "conformer_degeneracy": tab.attrs.get("conformer_degeneracy", np.nan),
             "fit_global_rmse": result.get("fit_stats", {}).get("rmse", np.nan),
             "fit_global_rss": result.get("fit_stats", {}).get("rss", np.nan),

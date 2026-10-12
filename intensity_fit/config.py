@@ -19,8 +19,13 @@ class SpeciesConfig:
     filters: dict[str, Any] | None = None
     fixed_scale: float | None = None
     fit_dipole_components: list[str] | None = None
-    delta_E_cm1: float | None = None
+    delta_E_cm1: float | None = None  # legacy alias of dE0, always in cm-1
     conformer_degeneracy: float = 1.0
+    dEe: float | None = None  # electronic energy relative to the reference conformer, in conformer_population_model.unit
+    dE0: float | None = None  # ZPE-corrected energy, same unit
+    exclude_from_Tconf_fit: bool = False
+    label: str | None = None  # name shown in reports/CSV (e.g. the name used in the article)
+    group: str | None = None  # free label (e.g. monomers, complexes); selects species for the conformer analysis
 
 
 @dataclass
@@ -29,6 +34,8 @@ class FitOptions:
     common_temperature: bool = True
     extraction_mode: str = "local_max"
     extraction_window_MHz: float = 0.05
+    correct_correlated_residuals: bool = True  # spectrum fit: multiply the covariance by the residual autocorrelation factor tau
+    blend_tolerance_MHz: float = 0.03  # line_intensity: transitions closer than this are ONE observed peak (0 = legacy, one datum per transition)
     fit_in_log_space: bool = False
     use_exact_temperature_scaling: bool = False
     temp_init_K: float = 2.0
@@ -218,6 +225,11 @@ def load_run_config(path: str | Path) -> RunConfig:
                 fit_dipole_components=item.get("fit_dipole_components"),
                 delta_E_cm1=item.get("delta_E_cm-1", item.get("delta_E_cm1")),
                 conformer_degeneracy=float(item.get("conformer_degeneracy", 1.0)),
+                dEe=item.get("dEe"),
+                dE0=item.get("dE0"),
+                exclude_from_Tconf_fit=bool(item.get("exclude_from_Tconf_fit", False)),
+                group=item.get("group"),
+                label=item.get("label"),
             )
         )
 

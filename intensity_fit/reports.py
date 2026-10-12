@@ -56,6 +56,12 @@ def write_ifit_report(
     lines.append("OPTIONS")
     lines.append(f" extraction_mode        {cfg.fit_options.extraction_mode}")
     lines.append(f" extraction_window_MHz  {cfg.fit_options.extraction_window_MHz:.6f}")
+    blend = result.get("blend")
+    if blend:
+        lines.append(
+            f" blend_tolerance_MHz    {blend['tolerance_MHz']:.4f}  ({blend['n_transitions']} transitions -> {blend['n_peaks']} peaks, "
+            f"{blend['n_blended_peaks']} of them blended" + ("; used for the line table only)" if blend.get("diagnostic_only") else ")")
+        )
     lines.append(f" fit_in_log_space       {cfg.fit_options.fit_in_log_space}")
     lines.append(f" exact_T_scaling        {cfg.fit_options.use_exact_temperature_scaling}")
     lines.append(f" common_temperature     {cfg.fit_options.common_temperature}")
@@ -77,6 +83,8 @@ def write_ifit_report(
             f"{_yn(sp.lin_file):>3} {_yn(sp.cat_file):>3} {_yn(sp.int_file):>3} {_yn(sp.out_file):>3} {_yn(sp.egy_file):>3} {_yn(sp.var_file):>3} "
             f"{_fmt_mu(dipoles.get('a')):>10} {_fmt_mu(dipoles.get('b')):>10} {_fmt_mu(dipoles.get('c')):>10} {fit_mu}"
         )
+        for warning in int_meta.get("warnings", []) if int_meta else []:
+            lines.append(f"   WARNING: {warning}")
         if int_meta:
             title = int_meta.get("title", "")
             if title:
@@ -166,6 +174,12 @@ def write_ifit_report(
     lines.append(f" loss          {fs.get('loss', 'linear')}")
     lines.append(f" lineshape     {fs.get('lineshape_profile', 'NA')}, FWHM={fs.get('lineshape_fwhm_MHz', np.nan):.6f} MHz, fitted={fs.get('lineshape_fwhm_fitted', False)}")
     lines.append(f" n_mc          {fs.get('n_mc', 0)}")
+    if np.isfinite(fs.get("residual_autocorr_factor", np.nan)):
+        tau = fs["residual_autocorr_factor"]
+        if fs.get("errors_scaled_by_autocorr", False):
+            lines.append(f" resid.autocorr tau={tau:.2f}  (correlated spectrum points: covariance multiplied by tau, errors by sqrt(tau)={np.sqrt(tau):.2f})")
+        else:
+            lines.append(f" resid.autocorr tau={tau:.2f}  (correlated spectrum points: the errors below are NOT corrected, multiply them by sqrt(tau)={np.sqrt(tau):.2f})")
     lines.append("")
     lines.append("FIXED TEMPERATURES FROM STEP 1" if first_step else "TEMPERATURES")
     if "Trot_fixed_K" in result:
@@ -213,37 +227,115 @@ def write_ifit_report(
             )
         lines.append("")
     lines.append("FINAL SPECIES RESULTS")
-    lines.append(" species                    n_lines  used  scale          rel_%     relmax    Trot/K    line_rmse  abc")
-    for _, row in species_summary.iterrows():
-        lines.append(
-            f" {row['species']:<26} {int(row['n_lines']):7d} {int(row['line_n_used']):5d} "
-            f"{row['scale']:12.5e} {100 * row['relative_abundance']:8.3f} "
-            f"{row['population_relmax']:8.4f} {row['Trot_K']:9.4f} {row['line_rmse']:10.4f} "
-            f"{int(row.get('n_a_type', 0))}/{int(row.get('n_b_type', 0))}/{int(row.get('n_c_type', 0))}"
-        )
+    rule = " " + "-" * 150
+    sp_header = (
+        " species                    label           n_lines  used  scale         +/-scale       rel_%    +/-rel_%   grp_%   +/-grp_%"
+        "   relmax  +/-relmax    Trot/K    line_rmse  abc"
+    )
 
-    if result.get("conformer_population_diagnostics"):
-        lines.append("")
-        lines.append("CONFORMER POPULATION DIAGNOSTIC")
-        lines.append(" species                    deltaE/cm-1  degeneracy  expected_%  fitted_%")
-        for item in result["conformer_population_diagnostics"]:
+    def _pct(value, width, decimals=3):
+        return f"{'NA':>{width}}" if not np.isfinite(value) else f"{100 * value:{width}.{decimals}f}"
+
+    groups_in_order = []
+    for g in species_summary["group"] if "group" in species_summary.columns else []:
+        g = g or "-"
+        if g not in groups_in_order:
+            groups_in_order.append(g)
+    if "group" not in species_summary.columns:
+        species_summary = species_summary.assign(group="-")
+        groups_in_order = ["-"]
+    for i_g, g in enumerate(groups_in_order):
+        if i_g:
+            lines.append("")
+        sub = species_summary[species_summary["group"].fillna("").replace("", "-") == g]
+        tot = sub["relative_abundance"].sum()
+        lines.append(rule)
+        lines.append(f" GROUP: {g}  ({len(sub)} species, sum of rel_% = {100 * tot:.3f})")
+        lines.append(rule)
+        lines.append(sp_header)
+        for _, row in sub.iterrows():
             lines.append(
-                f" {item['species']:<26} {item['delta_E_cm-1']:11.4f} {item['degeneracy']:10.3f} "
-                f"{100 * item['expected_fraction']:10.3f} {100 * item['fitted_fraction']:9.3f}"
+                f" {row['species']:<26} {str(row.get('label', row['species'])):<14} "
+                f"{int(row['n_lines']):7d} {int(row['line_n_used']):5d} "
+                f"{row['scale']:12.5e} {row.get('scale_err', np.nan):12.5e} {_pct(row['relative_abundance'], 8)} "
+                f"{_pct(row.get('relative_abundance_err', np.nan), 9)} {_pct(row.get('group_fraction', np.nan), 7)} "
+                f"{_pct(row.get('group_fraction_err', np.nan), 9)} "
+                f"{row['population_relmax']:8.4f} {row.get('population_relmax_err', np.nan):9.4f} {row['Trot_K']:9.4f} {row['line_rmse']:10.4f} "
+                f"{int(row.get('n_a_type', 0))}/{int(row.get('n_b_type', 0))}/{int(row.get('n_c_type', 0))}"
             )
+        lines.append(rule)
+
+    conf = result.get("conformer_analysis") or {}
+    if conf.get("rows"):
+        per_group = bool(conf.get("groups"))
+        lines.append("")
+        lines.append("CONFORMER POPULATIONS (frozen Boltzmann at Tconf vs fitted abundances)")
+        if per_group:
+            for g, ginfo in conf["groups"].items():
+                for ref, info in ginfo["fits"].items():
+                    err = info.get("Tconf_err_K", np.nan)
+                    err_txt = f" +/- {err:.1f}" if np.isfinite(err) else ""
+                    lines.append(f" {g}: {ref}: Tconf = {info['Tconf_K']:.1f}{err_txt} K  ({info['source']}, {info['n_species']} species)")
+        else:
+            for ref, info in conf["fits"].items():
+                err = info.get("Tconf_err_K", np.nan)
+                err_txt = f" +/- {err:.1f}" if np.isfinite(err) else ""
+                lines.append(f" {ref}: Tconf = {info['Tconf_K']:.1f}{err_txt} K  ({info['source']}, {info['n_species']} species)")
+        if conf.get("excluded"):
+            lines.append(f" excluded_from_Tconf_fit: {', '.join(conf['excluded'])}")
+        rule_c = " " + "-" * 111
+        from .conformers import energy_unit_to_cm1
+        unit = str(conf.get("unit", "cm-1"))
+        e_factor = energy_unit_to_cm1(unit)
+        e_dec = {"hartree": 7, "ev": 5}.get(unit.strip().lower(), 2)
+        e_head = f"E/{unit}"
+        c_header = f" {'species':<26} {'label':<14} {e_head:>9} {'degen':>8} {'expected_%':>10} {'fitted_%':>9} {'err_%':>7} {'fit/exp':>8}"
+        blocks = {}
+        for item in conf["rows"]:
+            key = (str(item.get("group", "") or "-"), item["reference"], float(item["Tconf_K"]), str(item.get("Tconf_source", "")))
+            blocks.setdefault(key, []).append(item)
+        for i_b, ((g, ref, tconf, source), items) in enumerate(blocks.items()):
+            lines.append("")
+            exp = np.array([100 * it["expected_fraction"] for it in items])
+            fit = np.array([100 * it["fitted_fraction"] for it in items])
+            ratio = np.array([it["fitted_over_expected"] for it in items])
+            rms = float(np.sqrt(np.mean((fit - exp) ** 2)))
+            ok = np.isfinite(ratio) & (ratio > 0)
+            rms_ln = float(np.sqrt(np.mean(np.log(ratio[ok]) ** 2))) if ok.any() else float("nan")
+            lines.append(rule_c)
+            lines.append(f" GROUP: {g}   ref: {ref}   Tconf = {tconf:.1f} K  ({source or 'n/a'})   {len(items)} species")
+            lines.append(rule_c)
+            lines.append(c_header)
+            for it in items:
+                lines.append(
+                    f" {it['species']:<26} {str(it.get('label', it['species'])):<14} {it['energy_cm-1'] / e_factor:9.{e_dec}f} {it['degeneracy']:8.3f} "
+                    f"{100 * it['expected_fraction']:10.3f} {100 * it['fitted_fraction']:9.3f} "
+                    f"{100 * it['fitted_fraction_err']:7.3f} {it['fitted_over_expected']:8.3f}"
+                )
+            lines.append(rule_c)
+            lines.append(f" RMS for {g} {ref} at Tconf {tconf:.1f} K:   RMS(fitted_% - expected_%) = {rms:.3f} %-points   RMS(ln fit/exp) = {rms_ln:.3f}")
+            lines.append(rule_c)
 
     lines.append("")
     lines.append("WORST LINES BY ABSOLUTE RESIDUAL")
     if line_diag.empty:
         lines.append(" none")
     else:
-        worst = line_diag[np.isfinite(line_diag["abs_residual"])].sort_values("abs_residual", ascending=False).head(20)
+        ranked = line_diag[np.isfinite(line_diag["abs_residual"])].sort_values("abs_residual", ascending=False)
+        if "cluster" in ranked.columns:  # blended peaks are listed once, with the summed model
+            ranked = pd.concat([ranked[ranked["cluster"] < 0], ranked[ranked["cluster"] >= 0].drop_duplicates("cluster")]).sort_values(
+                "abs_residual", ascending=False)
+        worst = ranked.head(20)
         lines.append(" species                    lin_freq/MHz  exp            calc           residual       QN")
         for _, row in worst.iterrows():
+            has_peak = "cluster" in row and row["cluster"] >= 0 and np.isfinite(row["cluster_model"])
+            blended = has_peak and row["n_in_cluster"] > 1
+            exp_v = row["cluster_exp"] if has_peak else row["exp_intensity"]
+            calc_v = row["cluster_model"] if has_peak else row["model_intensity"]
             lines.append(
                 f" {row['species']:<26} {row['lin_freq_MHz']:12.5f} "
-                f"{row['exp_intensity']:13.6e} {row['model_intensity']:13.6e} "
-                f"{row['residual']:13.6e} {row['QN_all']}"
+                f"{exp_v:13.6e} {calc_v:13.6e} "
+                f"{row['residual']:13.6e} {row['QN_all']}" + (f"  [+{int(row['n_in_cluster']) - 1} blended]" if blended else "")
             )
 
     if result.get("warnings"):
@@ -272,5 +364,5 @@ def print_console_summary(cfg: RunConfig, result: dict, species_summary: pd.Data
     )
     print(f"report    : {report_path}")
     print("\nSpecies:")
-    cols = ["species", "n_lines", "line_n_used", "relative_abundance", "population_relmax", "Trot_K", "line_rmse"]
+    cols = ["species"] + (["label"] if "label" in species_summary.columns and (species_summary["label"] != species_summary["species"]).any() else []) + ["n_lines", "line_n_used", "relative_abundance", "population_relmax", "Trot_K", "line_rmse"]
     print(species_summary[cols].to_string(index=False))

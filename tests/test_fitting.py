@@ -431,3 +431,104 @@ def test_warning_when_int_has_no_requested_dipole(tmp_path):
 
 def test_no_dipole_targets_no_warnings():
     assert fitting._build_fit_warnings({}, {}, []) == []
+
+
+# ---------- correlated spectrum points ----------
+
+def test_autocorr_factor_of_white_noise_is_one():
+    from intensity_fit.fitting import residual_autocorr_factor
+    rng = np.random.default_rng(0)
+    x = np.arange(20000) * 0.01
+    assert residual_autocorr_factor(x, rng.normal(size=x.size)) == pytest.approx(1.0, abs=0.15)
+
+
+def test_autocorr_factor_of_ar1_noise():
+    from intensity_fit.fitting import residual_autocorr_factor
+    rng = np.random.default_rng(1)
+    n, rho = 60000, 0.9
+    e = rng.normal(size=n); r = np.zeros(n)
+    for i in range(1, n):
+        r[i] = rho * r[i - 1] + e[i]
+    x = np.arange(n) * 0.01
+    assert residual_autocorr_factor(x, r) == pytest.approx((1 + rho) / (1 - rho), rel=0.2)   # = 19 for rho = 0.9
+
+
+def test_autocorr_factor_does_not_pair_points_across_gaps():
+    from intensity_fit.fitting import residual_autocorr_factor
+    rng = np.random.default_rng(2)
+    n = 4000
+    x = np.concatenate([np.arange(n) * 0.01, 1000.0 + np.arange(n) * 0.01])
+    r = np.concatenate([rng.normal(size=n), rng.normal(size=n)])
+    r[:n] += 5.0 * np.sin(np.arange(n) / 400.0)   # smooth drift inside the first block only
+    tau_blocks = residual_autocorr_factor(x, r)
+    assert tau_blocks > 1.5
+
+
+def test_short_residual_vector_gives_one():
+    from intensity_fit.fitting import residual_autocorr_factor
+    assert residual_autocorr_factor(np.arange(5.0), np.ones(5)) == 1.0
+
+
+def _spectrum_fit(scn, **opts):
+    return run_fit(scn, fit_mode="spectrum", residual_weighting="none", n_mc=400,
+                   lineshape={"profile": "gaussian", "fwhm_MHz": 0.08, "window_MHz": 0.3, "normalize": "area"}, **opts)[0]
+
+
+def _noisy_spectrum_scenario(tmp_path, seed=3):
+    scn = build_scenario(tmp_path, [SpeciesSpec("alpha", 3000.0, n_a=5, scale=0.5, T=6.0), SpeciesSpec("beta", 4000.0, n_a=4, scale=2.0, T=6.0)],
+                         normalize="area")
+    spec = np.loadtxt(scn.spectrum_path)
+    rng = np.random.default_rng(seed)
+    noise = np.convolve(rng.normal(size=spec.shape[0] + 20), np.ones(13) / 13.0, mode="same")[10:-10]   # correlated over ~13 points
+    spec[:, 1] += 0.02 * noise * spec[:, 1].max()
+    np.savetxt(scn.spectrum_path, spec, fmt="%.6f %.10e")
+    return scn
+
+
+def test_spectrum_errors_are_scaled_by_the_autocorrelation_factor(tmp_path):
+    scn = _noisy_spectrum_scenario(tmp_path)
+    on, off = _spectrum_fit(scn), _spectrum_fit(scn, correct_correlated_residuals=False)
+    tau = on["fit_stats"]["residual_autocorr_factor"]
+    assert tau > 3.0 and on["fit_stats"]["errors_scaled_by_autocorr"] is True
+    assert off["fit_stats"]["errors_scaled_by_autocorr"] is False
+    for name in ("alpha", "beta"):
+        assert on["species"][name]["scale"] == pytest.approx(off["species"][name]["scale"], rel=1e-9)     # central values unchanged
+        assert on["species"][name]["scale_err"] / off["species"][name]["scale_err"] == pytest.approx(np.sqrt(tau), rel=1e-6)
+        assert on["species"][name]["relative_abundance_mc_rms"] > 2.0 * off["species"][name]["relative_abundance_mc_rms"]
+    assert on["temperature_groups"]["ALL"]["Trot_err_K"] / off["temperature_groups"]["ALL"]["Trot_err_K"] == pytest.approx(np.sqrt(tau), rel=1e-6)
+    assert np.allclose(np.array(on["covariance_matrix"]), tau * np.array(off["covariance_matrix"]))
+
+
+def test_line_intensity_errors_are_not_scaled(tmp_path, two_species):
+    res, *_ = run_fit(two_species)
+    assert np.isnan(res["fit_stats"]["residual_autocorr_factor"]) and res["fit_stats"]["errors_scaled_by_autocorr"] is False
+
+
+def test_analytic_relative_abundance_error_matches_monte_carlo_for_small_errors(tmp_path):
+    scn = _noisy_spectrum_scenario(tmp_path)
+    res = _spectrum_fit(scn)
+    res_mc = run_fit(scn, fit_mode="spectrum", residual_weighting="none", n_mc=20000, random_seed=5,
+                     lineshape={"profile": "gaussian", "fwhm_MHz": 0.08, "window_MHz": 0.3, "normalize": "area"})[0]
+    for name in ("alpha", "beta"):
+        a = res_mc["species"][name]["relative_abundance_err"]
+        m = res_mc["species"][name]["relative_abundance_mc_rms"]
+        assert a > 0 and a == pytest.approx(m, rel=0.08)
+
+
+def test_analytic_relative_abundance_error_is_zero_when_all_scales_are_fixed_but_one(two_species):
+    cfg = load_run_config(two_species.config_path)
+    opts = FitOptions(**{**cfg.raw["fit"], "fixed_temperature_K": 6.0})
+    cfg.species[0].fixed_scale = 0.5
+    tables = build_species_tables(cfg.species, opts)
+    res = fit_mixture(tables, read_spectrum(cfg.spectrum_path), opts)
+    assert res["species"]["alpha"]["scale_fixed"] is True
+    assert res["species"]["beta"]["relative_abundance_err"] > 0
+    assert res["species"]["alpha"]["relative_abundance_err"] > 0          # depends on the free species through the normalisation
+
+
+def test_relative_abundance_errors_of_two_species_are_equal(two_species):
+    # f1 + f2 = 1, so the two fractions must carry the same uncertainty
+    res, *_ = run_fit(two_species, n_mc=0)
+    a, b = res["species"]["alpha"]["relative_abundance_err"], res["species"]["beta"]["relative_abundance_err"]
+    assert a == pytest.approx(b, rel=1e-6, abs=1e-15)
+    assert res["species"]["beta"]["population_relmax_err"] == pytest.approx(0.0, abs=1e-12)   # the reference species has relmax = 1 exactly

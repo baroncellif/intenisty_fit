@@ -7,6 +7,9 @@ import numpy as np
 import pandas as pd
 
 
+_DIPOLE_ID_COMPONENT = {1: "a", 2: "b", 3: "c"}
+
+
 def existing_file(path: str | None) -> str | None:
     if not path:
         return None
@@ -32,28 +35,35 @@ def read_int_metadata(filename: str | None) -> dict:
         for key, val in zip(keys, vals):
             out[key] = val
 
+    # SPCAT identifies the dipole operator by its ID (001/002/003 = a/b/c); the trailing comment is ignored.
+    # An ID listed more than once is added coherently by SPCAT, so the values are summed here as well.
+    values: dict[str, list[float]] = {}
     for line in lines[2:]:
         vals = _numbers(line)
         if len(vals) < 2:
             continue
         dip_id = int(vals[0])
         value = float(vals[1])
-        comment = line.split("/", 1)[1].strip().lower() if "/" in line else ""
-        component = None
-        if "a dipole" in comment or comment.startswith("a"):
-            component = "a"
-        elif "b dipole" in comment or comment.startswith("b"):
-            component = "b"
-        elif "c dipole" in comment or comment.startswith("c"):
-            component = "c"
-        elif dip_id == 1:
-            component = "a"
-        elif dip_id == 2:
-            component = "b"
-        elif dip_id == 3:
-            component = "c"
+        component = _DIPOLE_ID_COMPONENT.get(dip_id)
+        if component is None:  # non-standard operator ID: fall back to the comment
+            comment = line.split("/", 1)[1].strip().lower() if "/" in line else ""
+            for letter in "abc":
+                if f"{letter} dipole" in comment or comment.startswith(letter):
+                    component = letter
+                    break
         if component:
-            out["dipoles"][component] = value
+            values.setdefault(component, []).append(value)
+
+    out["dipole_ids"] = {c: len(v) for c, v in values.items()}
+    out["warnings"] = []
+    for component, vs in values.items():
+        out["dipoles"][component] = float(sum(vs))
+        if len(vs) > 1:
+            ids = {"a": "001", "b": "002", "c": "003"}[component]
+            out["warnings"].append(
+                f"dipole ID {ids} is listed {len(vs)} times ({', '.join(f'{v:g}' for v in vs)}); "
+                f"SPCAT adds them coherently, so mu_{component} = {sum(vs):g} D is used"
+            )
 
     return out
 

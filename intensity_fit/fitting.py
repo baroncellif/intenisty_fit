@@ -8,7 +8,8 @@ import numpy as np
 from scipy.optimize import least_squares
 
 from .config import FitOptions
-from .lineshape import lineshape_options, render_profiles
+from .blend import BlendOperator
+from .lineshape import lineshape_options, lineshape_values, render_profiles
 from .model import intensity_at_T_approx, intensity_at_T_exact
 from .tables import build_observation_table
 
@@ -127,6 +128,15 @@ def fit_mixture(
         y_exp = spec_y
     else:
         y_exp = y_exp_line
+    blend = None
+    sigma_blend = None
+    if fit_mode == "line_intensity" and float(fit_options.blend_tolerance_MHz) > 0:
+        blend = BlendOperator(
+            obs["lin_freq_MHz"].to_numpy(dtype=float), spectrum_df, fit_options.extraction_mode,
+            fit_options.extraction_window_MHz, lopts["fwhm_MHz"], lopts["profile"], fit_options.blend_tolerance_MHz,
+        )
+        y_exp = blend.exp[blend.valid]
+        sigma_blend = _intensity_sigma(y_exp, fit_options, residual_weighting)
     species_index = {name: i for i, name in enumerate(species_names)}
     obs_species_idx = obs["species"].map(species_index).to_numpy(dtype=int)
 
@@ -227,12 +237,15 @@ def fit_mixture(
                 normalize=lopts["normalize"],
             )
             return (spec_y - y_model) / sigma_spec
-        y_model = y_model_line
+        if blend is not None:
+            y_obs, y_model, sigma_fit = y_exp, blend.apply(y_model_line)[blend.valid], sigma_blend
+        else:
+            y_obs, y_model, sigma_fit = y_exp_line, y_model_line, sigma_line
         if fit_options.fit_in_log_space:
             eps = 1e-30
             sigma_log = max(np.log10(1.0 + float(fit_options.intensity_uncertainty_fraction)), 1e-12)
-            return (np.log10(y_exp_line + eps) - np.log10(y_model + eps)) / sigma_log
-        return (y_exp_line - y_model) / sigma_line
+            return (np.log10(y_obs + eps) - np.log10(y_model + eps)) / sigma_log
+        return (y_obs - y_model) / sigma_fit
 
     res = least_squares(
         residuals,
@@ -252,8 +265,32 @@ def fit_mixture(
             profile=lopts["profile"],
             normalize=lopts["normalize"],
         )
+    elif blend is not None:
+        cluster_model = blend.apply(y_model_line)
+        y_model = cluster_model[blend.valid]
+        obs["cluster"] = blend.cluster
+        obs["n_in_cluster"] = blend.n_in_cluster[blend.cluster]
+        obs["cluster_exp"] = blend.exp[blend.cluster]
+        obs["cluster_model"] = cluster_model[blend.cluster]
     else:
         y_model = y_model_line
+    spectrum_peak_diag = None
+    if fit_mode == "spectrum" and float(fit_options.blend_tolerance_MHz) > 0:
+        # per-peak comparison for the report: model spectrum extracted like the data (same units, blends summed)
+        spectrum_peak_diag = BlendOperator(
+            obs["lin_freq_MHz"].to_numpy(dtype=float), spectrum_df, fit_options.extraction_mode,
+            fit_options.extraction_window_MHz, fwhm_final, lopts["profile"], fit_options.blend_tolerance_MHz,
+        )
+        want = "area" if fit_options.extraction_mode == "area" else "peak"
+        y_units = y_model_line
+        if lopts["normalize"] != want:
+            peak_of_area = float(lineshape_values(np.array([0.0]), 0.0, fwhm_final, lopts["profile"], "area")[0])
+            y_units = y_model_line * peak_of_area if want == "peak" else y_model_line / peak_of_area
+        cluster_model = spectrum_peak_diag.apply(y_units)
+        obs["cluster"] = spectrum_peak_diag.cluster
+        obs["n_in_cluster"] = spectrum_peak_diag.n_in_cluster[spectrum_peak_diag.cluster]
+        obs["cluster_exp"] = spectrum_peak_diag.exp[spectrum_peak_diag.cluster]
+        obs["cluster_model"] = cluster_model[spectrum_peak_diag.cluster]
     r = np.asarray(res.fun, dtype=float)
     raw_residual = y_exp - y_model
     raw_line_residual = y_exp_line - y_model_line
@@ -272,11 +309,19 @@ def fit_mixture(
     cov = None
     perr = None
     cond_JTJ = np.nan
+    # Neighbouring spectrum points are not independent (a line spans many points), so the formal covariance
+    # sigma2 * (J^T J)^-1 is too small by about the integrated autocorrelation factor tau of the residuals.
+    autocorr_tau = residual_autocorr_factor(spec_x, r) if fit_mode == "spectrum" else np.nan
+    errors_scaled_by_tau = bool(
+        fit_mode == "spectrum" and fit_options.correct_correlated_residuals and np.isfinite(autocorr_tau) and autocorr_tau > 1.0
+    )
     try:
         J = np.asarray(res.jac, dtype=float)
         JTJ = J.T @ J
         cond_JTJ = float(np.linalg.cond(JTJ))
         cov = sigma2 * np.linalg.pinv(JTJ)
+        if errors_scaled_by_tau:
+            cov = cov * autocorr_tau
         perr = np.sqrt(np.diag(cov))
     except Exception:
         pass
@@ -331,9 +376,17 @@ def fit_mixture(
             "lineshape_fwhm_fitted": fit_fwhm,
             "lineshape_normalize": lopts["normalize"],
             "line_raw_rmse": float(np.sqrt(np.mean(raw_line_residual ** 2))),
+            "residual_autocorr_factor": autocorr_tau,
+            "errors_scaled_by_autocorr": errors_scaled_by_tau,
         },
         "species": {},
         "dipole_scales": _format_dipole_scales(dipole_scale_final),
+        "blend": None if (blend is None and spectrum_peak_diag is None) else {
+            "tolerance_MHz": float(fit_options.blend_tolerance_MHz), "n_transitions": int(len(obs)),
+            "n_peaks": int((blend or spectrum_peak_diag).valid.sum()),
+            "n_blended_peaks": int((((blend or spectrum_peak_diag).n_in_cluster > 1) & (blend or spectrum_peak_diag).valid).sum()),
+            "diagnostic_only": blend is None,
+        },
     }
 
     if cov is not None:
@@ -361,6 +414,22 @@ def fit_mixture(
             key = _dipole_target_key(target)
             out["dipole_scales"][key]["scale_err"] = float(scale * perr[dipole_offset + i])
 
+    # analytic (first-order) errors of the relative abundances from the covariance of ln(scale); fixed scales have zero variance
+    n_sp = len(species_names)
+    rel_err = np.full(n_sp, np.nan)
+    relmax_err = np.full(n_sp, np.nan)
+    if cov is not None and np.all(np.isfinite(A)) and np.sum(A) > 0:
+        C_ln = np.zeros((n_sp, n_sp))
+        fit_pos = [species_names.index(nm) for nm in fitted_species]
+        C_ln[np.ix_(fit_pos, fit_pos)] = np.asarray(cov)[:n_fitted_species, :n_fitted_species]
+        eye = np.eye(n_sp)
+        i_max = int(np.argmax(A))
+        for k in range(n_sp):
+            g = eye[k] - rel_sum
+            rel_err[k] = rel_sum[k] * np.sqrt(max(float(g @ C_ln @ g), 0.0))
+            h = eye[k] - eye[i_max]
+            relmax_err[k] = rel_max[k] * np.sqrt(max(float(h @ C_ln @ h), 0.0))
+
     for i, name in enumerate(species_names):
         scale = float(A_map[name])
         if name in fixed_species:
@@ -382,6 +451,8 @@ def fit_mixture(
             "scale_err": scale_err,
             "scale_fixed": is_fixed,
             "relative_abundance": float(rel_sum[i]),
+            "relative_abundance_err": float(rel_err[i]),
+            "population_relmax_err": float(relmax_err[i]),
             "population_relmax": float(rel_max[i]),
             "Trot_K": float(Ts_final[name]),
         }
@@ -397,6 +468,34 @@ def fit_mixture(
     _add_scale_monte_carlo(out, res.x, cov, species_names, fitted_species, fixed_species, fit_options)
     out["warnings"] = _build_fit_warnings(out, species_tables, dipole_targets)
     return out
+
+
+def residual_autocorr_factor(x, r, max_lag: int = 100) -> float:
+    """Integrated autocorrelation factor tau = 1 + 2*sum(rho_k) of the residuals of contiguous spectrum points.
+
+    The formal errors of a spectrum fit assume independent points; with oversampled lines (many points per FWHM)
+    the real variance is larger by about tau (errors by sqrt(tau)).  Lags never cross a gap in the point list.
+    """
+    x = np.asarray(x, dtype=float)
+    r = np.asarray(r, dtype=float)
+    if r.size < 10:
+        return 1.0
+    dx = float(np.median(np.diff(x)))
+    block = np.cumsum(np.r_[0, np.diff(x) > 1.5 * dx])
+    r0 = r - r.mean()
+    var = float(np.mean(r0 ** 2))
+    if var <= 0.0:
+        return 1.0
+    tau = 1.0
+    for k in range(1, min(max_lag, r.size - 1) + 1):
+        same = block[k:] == block[:-k]
+        if not same.any():
+            break
+        rho = float(np.mean(r0[k:][same] * r0[:-k][same])) / var
+        if rho <= 0.0:
+            break
+        tau += 2.0 * rho
+    return tau
 
 
 def _spectrum_points_for_windows(spectrum_df, centers: np.ndarray, window_MHz: float) -> tuple[np.ndarray, np.ndarray]:

@@ -4,9 +4,10 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 
 from .config import RunConfig, load_run_config
-from .constants import C2
+from .conformers import analyze_conformers, group_fractions
 from .fitting import fit_mixture
 from .pickett_meta import make_partition_function
 from .plotting import show_interactive_overlay_plot, write_quick_overlay_plot, write_species_line_pdf
@@ -30,10 +31,19 @@ def run_from_config(config_path: str | Path) -> dict:
         fit_options=cfg.fit_options,
         q_functions=q_functions,
     )
-    result["conformer_population_diagnostics"] = _conformer_population_diagnostics(cfg, result, species_tables)
+    conformers = analyze_conformers(cfg.species, cfg.fit_options, result)
+    result["conformer_analysis"] = conformers
+    result["conformer_population_diagnostics"] = conformers["rows"]
+    int_warnings = [
+        f"{name}: .int {w}" for name, tab in species_tables.items() for w in tab.attrs.get("int_metadata", {}).get("warnings", [])
+    ]
+    result["warnings"] = list(result.get("warnings", [])) + conformers["warnings"] + int_warnings
 
     line_diag = build_line_diagnostic_table(species_tables, spectrum_df, result, cfg.fit_options, q_functions=q_functions)
     species_summary = build_species_diagnostic_summary(species_tables, result, line_diag_df=line_diag)
+    gf = group_fractions(cfg.species, result)   # abundance relative to the sum over the species' own group
+    species_summary["group_fraction"] = species_summary["species"].map(lambda n: gf.get(n, (np.nan, np.nan))[0])
+    species_summary["group_fraction_err"] = species_summary["species"].map(lambda n: gf.get(n, (np.nan, np.nan))[1])
 
     report_path = output_dir / f"{cfg.name}.ifit"
     write_ifit_report(report_path, cfg, result, species_summary, line_diag, species_tables=species_tables)
@@ -41,6 +51,8 @@ def run_from_config(config_path: str | Path) -> dict:
     species_summary.to_csv(output_dir / "species_summary.csv", index=False, float_format="%.10g")
     line_diag.to_csv(output_dir / "line_diagnostics.csv", index=False, float_format="%.10g")
     result["observation_table"].to_csv(output_dir / "observations.csv", index=False, float_format="%.10g")
+    if conformers["rows"]:
+        pd.DataFrame(conformers["rows"]).to_csv(output_dir / "conformer_populations.csv", index=False, float_format="%.10g")
 
     plot_cfg = dict(cfg.fit_options.plot or cfg.plot or {})
     quick_plot = None
@@ -89,41 +101,3 @@ def _build_q_functions(species_tables: dict) -> dict:
         if qfunc is not None:
             q_functions[name] = qfunc
     return q_functions
-
-
-def _conformer_population_diagnostics(cfg: RunConfig, result: dict, species_tables: dict) -> list[dict]:
-    model = cfg.fit_options.conformer_population_model or {}
-    if not model.get("enabled", False):
-        return []
-
-    temp_source = model.get("temperature_source", "mean_rotational_temperature")
-    if temp_source == "fixed":
-        T = float(model["temperature_K"])
-    else:
-        Ts = [vals["Trot_K"] for vals in result["species"].values()]
-        T = float(np.mean(Ts))
-
-    weights = []
-    for sp in cfg.species:
-        dE = sp.delta_E_cm1
-        if dE is None:
-            dE = 0.0 if sp.name == model.get("reference_species") else np.nan
-        if np.isfinite(dE):
-            w = sp.conformer_degeneracy * np.exp(-C2 * float(dE) / T)
-        else:
-            w = np.nan
-        weights.append(w)
-
-    total = float(np.nansum(weights))
-    out = []
-    for sp, w in zip(cfg.species, weights):
-        fitted = result["species"][sp.name]["relative_abundance"]
-        out.append({
-            "species": sp.name,
-            "delta_E_cm-1": float(sp.delta_E_cm1 if sp.delta_E_cm1 is not None else np.nan),
-            "degeneracy": float(sp.conformer_degeneracy),
-            "temperature_K": T,
-            "expected_fraction": float(w / total) if total > 0 and np.isfinite(w) else np.nan,
-            "fitted_fraction": float(fitted),
-        })
-    return out
